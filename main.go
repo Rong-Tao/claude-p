@@ -44,6 +44,12 @@ func main() {
 		case "acp":
 			acpMain()
 			return
+		case "usage":
+			if err := usageMain(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "claude-p usage: "+err.Error())
+				os.Exit(1)
+			}
+			return
 		}
 	}
 	if err := run(os.Args[1:]); err != nil {
@@ -87,6 +93,7 @@ type options struct {
 	prompt        string
 	jsonOut       bool
 	monitor       bool
+	dump          string // --dump <file>：把代理抓到的完整请求追加写入此文件（ndjson）
 	keep          bool
 	noAutoApprove bool
 	cwd           string
@@ -120,6 +127,7 @@ func run(argv []string) error {
 		passthrough: opt.passthrough,
 		autoApprove: !opt.noAutoApprove,
 		useProxy:    true,
+		dumpFile:    opt.dump,
 	})
 	if err != nil {
 		return err
@@ -242,45 +250,106 @@ func writeSettings(path, stopCmd, approveCmd string, autoApprove bool) error {
 // ---------- 监测代理 ----------
 
 type proxy struct {
-	port string
-	srv  *http.Server
-	mu   sync.Mutex
-	reqs []proxReq
+	port    string
+	srv     *http.Server
+	mu      sync.Mutex
+	reqs    []proxReq
+	dumpFile string // 若非空，每条请求追加写入此文件
 }
 
 type proxReq struct {
-	Path  string
-	Model string
+	Path        string            `json:"path"`
+	Method      string            `json:"method"`
+	Model       string            `json:"model"`
+	ReqHeaders  map[string]string `json:"req_headers"`
+	ReqBody     json.RawMessage   `json:"req_body,omitempty"`
+	RespHeaders map[string]string `json:"resp_headers,omitempty"`
+	RespStatus  int               `json:"resp_status,omitempty"`
+}
+
+// 感兴趣的请求头（脱敏：Authorization 只保留类型和前缀）
+var captureHeaders = []string{
+	"User-Agent", "X-App", "Anthropic-Version", "Anthropic-Beta",
+	"Content-Type", "Authorization", "X-Api-Key",
 }
 
 func startProxy() (*proxy, error) {
+	return startProxyWithDump("")
+}
+
+func startProxyWithDump(dumpFile string) (*proxy, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	target, _ := url.Parse("https://api.anthropic.com")
-	p := &proxy{port: fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)}
+	p := &proxy{port: fmt.Sprint(ln.Addr().(*net.TCPAddr).Port), dumpFile: dumpFile}
 	rp := httputil.NewSingleHostReverseProxy(target)
 	rp.FlushInterval = -1
 	orig := rp.Director
 	rp.Director = func(r *http.Request) {
 		orig(r)
 		r.Host = target.Host
-		if strings.HasPrefix(r.URL.Path, "/v1/messages") {
-			model := ""
-			if r.Body != nil {
-				body, _ := io.ReadAll(r.Body)
-				r.Body = io.NopCloser(bytes.NewReader(body))
-				var m struct {
-					Model string `json:"model"`
-				}
-				json.Unmarshal(body, &m)
-				model = m.Model
-			}
-			p.mu.Lock()
-			p.reqs = append(p.reqs, proxReq{Path: r.URL.Path, Model: model})
-			p.mu.Unlock()
+		// 记录所有路径（不只 /v1/messages）
+
+		pr := proxReq{
+			Path:       r.URL.Path,
+			Method:     r.Method,
+			ReqHeaders: map[string]string{},
 		}
+		for _, h := range captureHeaders {
+			if v := r.Header.Get(h); v != "" {
+				if h == "Authorization" && len(v) > 20 {
+					// 保留 "Bearer sk-ant-oat01-..." 前缀供识别，截断实际 token
+					parts := strings.SplitN(v, "-", 3)
+					if len(parts) >= 2 {
+						v = parts[0] + "-" + parts[1] + "-…[redacted]"
+					} else {
+						v = v[:20] + "…[redacted]"
+					}
+				}
+				pr.ReqHeaders[h] = v
+			}
+		}
+		if r.Body != nil {
+			body, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var m struct {
+				Model string `json:"model"`
+			}
+			json.Unmarshal(body, &m)
+			pr.Model = m.Model
+			pr.ReqBody = json.RawMessage(body)
+		}
+		p.mu.Lock()
+		p.reqs = append(p.reqs, pr)
+		idx := len(p.reqs) - 1
+		p.mu.Unlock()
+
+		// 在 ModifyResponse 里补充 resp 信息——通过 idx 回写
+		_ = idx
+	}
+	rp.ModifyResponse = func(resp *http.Response) error {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if len(p.reqs) == 0 {
+			return nil
+		}
+		pr := &p.reqs[len(p.reqs)-1]
+		pr.RespStatus = resp.StatusCode
+		pr.RespHeaders = map[string]string{}
+		for k, vs := range resp.Header {
+			pr.RespHeaders[k] = vs[0]
+		}
+		if p.dumpFile != "" {
+			line, _ := json.Marshal(pr)
+			f, err := os.OpenFile(p.dumpFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+			if err == nil {
+				f.Write(append(line, '\n'))
+				f.Close()
+			}
+		}
+		return nil
 	}
 	rp.ErrorLog = log.New(io.Discard, "", 0) // 清理时关连接的 context-canceled 噪音
 	p.srv = &http.Server{Handler: rp, ErrorLog: log.New(io.Discard, "", 0)}
@@ -308,7 +377,13 @@ func (p *proxy) report(w io.Writer) {
 	defer p.mu.Unlock()
 	fmt.Fprintf(w, "[claude-p monitor] %d 次 /v1/messages 调用\n", len(p.reqs))
 	for i, r := range p.reqs {
-		fmt.Fprintf(w, "  #%d %s model=%s\n", i+1, r.Path, r.Model)
+		fmt.Fprintf(w, "  #%d %s  model=%s  status=%d\n", i+1, r.Path, r.Model, r.RespStatus)
+		for k, v := range r.ReqHeaders {
+			fmt.Fprintf(w, "    req  %-35s %s\n", k+":", v)
+		}
+		for k, v := range r.RespHeaders {
+			fmt.Fprintf(w, "    resp %-35s %s\n", k+":", v)
+		}
 	}
 }
 
@@ -371,6 +446,12 @@ func parse(argv []string) (options, error) {
 			}
 		case a == "--monitor":
 			o.monitor = true
+		case a == "--dump":
+			if i+1 >= len(argv) {
+				return o, fmt.Errorf("--dump 需要参数（文件路径）")
+			}
+			i++
+			o.dump = argv[i]
 		case a == "--keep":
 			o.keep = true
 		case a == "--no-auto-approve":

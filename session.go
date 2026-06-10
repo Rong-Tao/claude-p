@@ -17,6 +17,7 @@ type sessionConfig struct {
 	passthrough []string
 	autoApprove bool
 	useProxy    bool
+	dumpFile    string // 若非空，代理把完整请求 ndjson 追加写入此文件
 }
 
 // liveSession 持有一个 tmux 里运行的真·交互 claude，可被多次 prompt（多轮）。
@@ -59,7 +60,7 @@ func newLiveSession(self string, cfg sessionConfig) (*liveSession, error) {
 
 	var baseURL string
 	if cfg.useProxy {
-		prox, err := startProxy()
+		prox, err := startProxyWithDump(cfg.dumpFile)
 		if err != nil {
 			return nil, err
 		}
