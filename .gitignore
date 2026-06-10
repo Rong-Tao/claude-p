@@ -1,0 +1,6 @@
+/claude-p
+/claudep
+*.exe
+*.test
+*.out
+.DS_Store
